@@ -5,6 +5,7 @@ Gateway via TEDAPI (pypowerwall), serves a self-updating webpage on the home LAN
 No Tesla cloud involved.
 """
 import json, os, sqlite3, threading, time
+import urllib.request, urllib.parse, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from pypowerwall.tedapi import TEDAPI
@@ -18,6 +19,7 @@ DB_PATH = os.environ.get("PW_DB", os.path.expanduser("~/pw_history.db"))
 LOG_EVERY = float(os.environ.get("PW_LOG", "20"))       # seconds between history rows
 HISTORY_DAYS = int(os.environ.get("PW_HISTORY_DAYS", "60"))
 WC_IPS = [x.strip() for x in os.environ.get("PW_WC", "192.168.1.74").split(",") if x.strip()]
+FLEET_EVERY = float(os.environ.get("PW_FLEET", "120"))  # seconds between Fleet live_status polls
 GW_HOST = os.environ.get("PW_GW_HOST", "192.168.91.1")
 KEY_PATH = os.environ.get("PW_RSA_KEY", os.path.expanduser("~/.pypowerwall/tedapi_rsa_private.pem"))
 VALID_MODES = ("self_consumption", "autonomous", "backup")  # Self-Powered / Time-Based / Backup
@@ -75,6 +77,7 @@ def pricing(range_s):
     maxgap = LOG_EVERY * 3
     days = {}
     tot = {"cost": 0.0, "credit": 0.0, "savings": 0.0, "import_kwh": 0.0, "export_kwh": 0.0}
+    buckets = {}; bucket_s = max(1.0, range_s / 56.0)  # time-bucketed net $ for the chart
     for a, b in zip(rows, rows[1:]):
         dt = b[0] - a[0]
         if dt <= 0 or dt > maxgap:
@@ -93,6 +96,8 @@ def pricing(range_s):
         d["cost"] += cost; d["credit"] += credit; d["savings"] += save
         tot["cost"] += cost; tot["credit"] += credit; tot["savings"] += save
         tot["import_kwh"] += gi; tot["export_kwh"] += ge
+        bk = buckets.setdefault(int((ts - start) / bucket_s), {"t": 0, "n": 0, "net": 0.0})
+        bk["t"] += ts; bk["n"] += 1; bk["net"] += (credit - cost)
     tkey = time.strftime("%Y-%m-%d", time.localtime(now))
     td = days.get(tkey, {"cost": 0, "credit": 0, "savings": 0})
     today = {"cost": round(td["cost"], 2), "credit": round(td["credit"], 2),
@@ -101,8 +106,11 @@ def pricing(range_s):
               "cost": round(days[k]["cost"], 2), "savings": round(days[k]["savings"], 2)}
              for k in sorted(days)]
     tot["net"] = tot["credit"] - tot["cost"]
+    series = [{"t": int(buckets[k]["t"] / buckets[k]["n"]), "net": round(buckets[k]["net"], 3)}
+              for k in sorted(buckets)]
     return {"plan": RATES.get("plan"), "export_mode": RATES.get("export_mode"),
-            "today": today, "totals": {k: round(v, 2) for k, v in tot.items()}, "daily": daily}
+            "today": today, "totals": {k: round(v, 2) for k, v in tot.items()},
+            "daily": daily, "series": series}
 
 _data = {"ok": False, "error": "starting up", "ts": time.time()}
 _lock = threading.Lock()
@@ -382,70 +390,95 @@ def stats(range_s):
     return out
 
 
-# ── control (signed v1r writes). Requires a registered RSA key at KEY_PATH. ──
-_ctl_client = None
-_ctl_lock = threading.Lock()
+# ── control via Tesla Fleet API (cloud). Tokens live in ~/.tesla-fleet/. ──
+FLEET_DIR = os.path.expanduser("~/.tesla-fleet")
+SITE_ID = os.environ.get("PW_SITE", "2534055803513998")
 _force_heavy = threading.Event()
+_fleet_lock = threading.Lock()
+
+
+def fleet_available():
+    return (os.path.exists(os.path.join(FLEET_DIR, "tokens.json"))
+            and os.path.exists(os.path.join(FLEET_DIR, "fleet.json")))
+
+
+def _fleet_token():
+    """Valid access token, auto-refreshed via the refresh token when stale."""
+    with _fleet_lock:
+        cfg = json.load(open(os.path.join(FLEET_DIR, "fleet.json")))
+        tp = os.path.join(FLEET_DIR, "tokens.json")
+        tok = json.load(open(tp))
+        if tok.get("access_token") and time.time() < tok.get("_expires_at", 0) - 60:
+            return tok["access_token"]
+        data = urllib.parse.urlencode({
+            "grant_type": "refresh_token", "client_id": cfg["client_id"],
+            "refresh_token": tok["refresh_token"]}).encode()
+        r = json.load(urllib.request.urlopen(urllib.request.Request(
+            "https://auth.tesla.com/oauth2/v3/token", data=data), timeout=20))
+        tok["access_token"] = r["access_token"]
+        if r.get("refresh_token"):
+            tok["refresh_token"] = r["refresh_token"]
+        tok["_expires_at"] = time.time() + r.get("expires_in", 28800)
+        json.dump(tok, open(tp, "w")); os.chmod(tp, 0o600)
+        return tok["access_token"]
+
+
+def fleet_api(path, body=None):
+    cfg = json.load(open(os.path.join(FLEET_DIR, "fleet.json")))
+    at = _fleet_token()
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        cfg["audience"] + path, data=data,
+        method=("POST" if body is not None else "GET"),
+        headers={"Authorization": "Bearer " + at, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        return json.load(r)
+
+
+def fleet_live():
+    return (fleet_api("/api/1/energy_sites/%s/live_status" % SITE_ID) or {}).get("response", {})
 
 
 def control_available():
-    return os.path.exists(KEY_PATH)
-
-
-def control_client():
-    """Lazily build a v1r-capable Powerwall client for writes."""
-    global _ctl_client
-    with _ctl_lock:
-        if _ctl_client is None:
-            from pypowerwall import Powerwall
-            _ctl_client = Powerwall(host=GW_HOST, gw_pwd=current_pwd(),
-                                    rsa_key_path=KEY_PATH, timeout=TIMEOUT)
-        return _ctl_client
-
-
-def reset_control_client():
-    global _ctl_client
-    with _ctl_lock:
-        _ctl_client = None
+    return fleet_available()
 
 
 def do_control(action, value):
-    """Dispatch one control action. Never called by the dashboard itself."""
-    if not control_available():
-        return {"ok": False, "error": "control not enabled — register an RSA key first (see setup)"}
+    """Dispatch one control action via the Fleet API (cloud)."""
+    if not fleet_available():
+        return {"ok": False, "error": "Fleet API not set up yet"}
+    base = "/api/1/energy_sites/%s" % SITE_ID
     try:
-        pw = control_client()
         if action == "reserve":
             lvl = float(value)
             if not (0 <= lvl <= 100):
                 return {"ok": False, "error": "reserve must be 0-100"}
-            r = pw.set_reserve(lvl)
+            r = fleet_api(base + "/backup", {"backup_reserve_percent": int(round(lvl))})
         elif action == "mode":
             if value not in VALID_MODES:
                 return {"ok": False, "error": "invalid mode"}
-            r = pw.set_mode(value)
+            r = fleet_api(base + "/operation", {"default_real_mode": value})
         elif action == "grid_charging":
-            r = pw.set_grid_charging(bool(value))
+            r = fleet_api(base + "/grid_import_export",
+                          {"disallow_charge_from_grid_with_solar_installed": (not bool(value))})
         elif action == "grid_export":
             if value not in ("battery_ok", "pv_only", "never"):
                 return {"ok": False, "error": "invalid export mode"}
-            r = pw.set_grid_export(value)
-        elif action == "off_grid":
-            r = pw.go_off_grid()
-        elif action == "reconnect":
-            r = pw.reconnect_grid()
-        elif action == "max_backup_on":
-            r = pw.schedule_max_backup(duration_seconds=int(value or 7200))
-        elif action == "max_backup_off":
-            r = pw.cancel_max_backup()
+            r = fleet_api(base + "/grid_import_export", {"customer_preferred_export_rule": value})
+        elif action == "storm_on":
+            r = fleet_api(base + "/storm_mode", {"enabled": True})
+        elif action == "storm_off":
+            r = fleet_api(base + "/storm_mode", {"enabled": False})
         else:
             return {"ok": False, "error": "unknown action"}
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": "Tesla %d: %s" % (e.code, e.read().decode()[:200])}
     except Exception as e:
-        reset_control_client()
         return {"ok": False, "error": str(e)}
     _force_heavy.set()  # re-read settings on the next poll
-    ok = r is not None and r is not False
-    return {"ok": ok, "result": r if isinstance(r, (dict, list, str, int, float, bool)) else str(r)}
+    resp = (r or {}).get("response", r) if isinstance(r, dict) else r
+    ok = not (isinstance(resp, dict) and resp.get("result") is False)
+    return {"ok": ok, "result": resp}
 
 
 def fetch_wc(ip, timeout=2.0):
@@ -473,6 +506,7 @@ def poller():
     last_heavy = 0.0
     last_log = 0.0
     last_prune = 0.0
+    last_fleet = 0.0
     try:
         logdb = db_connect()
     except Exception:
@@ -529,7 +563,7 @@ def poller():
                         cache.pop(key + "_err", None)
                     except Exception as e:
                         cache[key + "_err"] = str(e)
-                # Wall Connectors (read-only local API)
+                # Wall Connectors (read-only local API — richest for the LAN one)
                 cache["wc"] = [fetch_wc(ip) for ip in WC_IPS]
                 wcp = 0.0
                 for c in cache["wc"]:
@@ -537,6 +571,24 @@ def poller():
                     if v.get("contactor_closed"):
                         wcp += (v.get("vehicle_current_a") or 0) * (v.get("grid_v") or 0)
                 cache["wc_power"] = round(wcp)
+                # Fleet API: BOTH Wall Connectors + storm status (own slower cadence)
+                if fleet_available() and now - last_fleet >= FLEET_EVERY:
+                    try:
+                        ls = fleet_live()
+                        fw = []
+                        for w in (ls.get("wall_connectors") or []):
+                            din = w.get("din", ""); ser = din.split("--")[-1] if "--" in din else din
+                            fw.append({"serial": ser, "din": din,
+                                       "power": w.get("wall_connector_power", 0),
+                                       "state": w.get("wall_connector_state"), "vin": w.get("vin", "")})
+                        cache["fleet_wc"] = fw
+                        cache["storm"] = ls.get("storm_mode_active")
+                        cache.pop("fleet_err", None)
+                        if fw:  # Fleet catches charging on EITHER connector
+                            cache["wc_power"] = round(sum((w.get("power") or 0) for w in fw))
+                    except Exception as e:
+                        cache["fleet_err"] = str(e)
+                    last_fleet = now
                 # current Powerwall settings (for the Control panel)
                 try:
                     cfg = t.get_config() or {}
@@ -898,7 +950,7 @@ svg.chart{cursor:crosshair}
         <div class="tile"><div class="bar" style="background:var(--acc)"></div><div class="lbl">Net grid today</div><div class="val" id="pr_net">—</div></div>
         <div class="tile"><div class="bar" style="background:var(--solar)"></div><div class="lbl">Solar + battery saved</div><div class="val" id="pr_save">—</div></div>
       </div>
-      <div class="statlbl" style="margin-top:14px">Net grid $ per day &nbsp;(− = you paid · + = you earned)</div>
+      <div class="statlbl" style="margin-top:14px">Money in/out across this window &nbsp;(<span style="color:var(--grid2)">green = earning</span> · <span style="color:var(--grid)">red = paying</span>) — drag to read</div>
       <svg class="chart" id="chart-price" viewBox="0 0 640 160" preserveAspectRatio="none"></svg>
       <div class="setnote" id="price_note"></div>
     </div>
@@ -982,15 +1034,13 @@ svg.chart{cursor:crosshair}
     </div>
     <div class="setmsg" id="ctl_msg"></div>
   </div>
-  <div class="section"><h2>Advanced</h2>
+  <div class="section"><h2>Storm Watch</h2>
     <div class="gauge">
       <div class="ctlbtns">
-        <button class="mbtn danger" onclick="ctl('off_grid',1,'⚠ Disconnect your home from the grid (island)? Home will run on solar + battery only until you reconnect.')">Go off-grid</button>
-        <button class="mbtn" onclick="ctl('reconnect',1,'Reconnect to the grid?')">Reconnect grid</button>
-        <button class="mbtn" onclick="ctl('max_backup_on',7200,'Charge Powerwalls toward 100% now (2-hour max-backup)?')">Max backup (2h)</button>
-        <button class="mbtn" onclick="ctl('max_backup_off',0,'Cancel the max-backup charge?')">Cancel max backup</button>
+        <button class="mbtn" onclick="ctl('storm_on',1,'Turn Storm Watch ON? The Powerwalls will charge to full to prepare for a possible outage.')">Storm Watch on</button>
+        <button class="mbtn" onclick="ctl('storm_off',1,'Turn Storm Watch off?')">Storm Watch off</button>
       </div>
-      <div class="setnote">Off-grid intentionally islands your home. Max-backup charges the Powerwalls to full (useful before a storm). These take effect immediately — confirm carefully.</div>
+      <div class="setnote">Storm Watch charges the Powerwalls to 100% to prepare for a possible outage. (Off-grid islanding isn't exposed by the Fleet API, so it isn't shown here.)</div>
     </div>
   </div>
 </div>
@@ -1329,6 +1379,26 @@ async function loadStats(){
   try{const r=await fetch('stats.json?range='+_range,{cache:'no-store'});renderStats(await r.json());}catch(e){}
 }
 function money(v){if(v==null)return'—';return (v<0?'-$':'$')+Math.abs(v).toFixed(2);}
+function barChart(svgId,times,vals){
+  const svg=$(svgId),vb=svg.viewBox.baseVal,w=vb.width,h=vb.height;
+  const pad={l:46,r:10,t:10,b:22},x0=pad.l,x1=w-pad.r,y0=h-pad.b,y1=pad.t;
+  if(!times||times.length<1){svg.innerHTML='<text x="'+(w/2)+'" y="'+(h/2)+'" text-anchor="middle" fill="#8ea0bd" font-size="12">collecting data…</text>';return;}
+  let mx=0; vals.forEach(v=>{if(v!=null&&Math.abs(v)>mx)mx=Math.abs(v);}); mx=niceMax(mx||1); const mn=-mx;
+  const tmin=times[0],tmax=times[times.length-1],tr=(tmax-tmin)||1;
+  const sx=t=>x0+(t-tmin)/tr*(x1-x0), sy=v=>y0-(v-mn)/(mx-mn)*(y0-y1), zero=sy(0);
+  const m=v=>(v<0?'-$':'$')+Math.abs(v).toFixed(2);
+  let g='';
+  for(let i=0;i<=4;i++){const v=mn+(mx-mn)*i/4,yy=sy(v).toFixed(1);
+    g+='<line class="chartgrid" x1="'+x0+'" y1="'+yy+'" x2="'+x1+'" y2="'+yy+'"/><text class="charty" x="'+(x0-4)+'" y="'+(+yy+3)+'" text-anchor="end">'+m(v)+'</text>';}
+  g+='<line class="chartzero" x1="'+x0+'" y1="'+zero.toFixed(1)+'" x2="'+x1+'" y2="'+zero.toFixed(1)+'"/>';
+  const bw=Math.max(1.5,(x1-x0)/times.length*0.78);
+  for(let i=0;i<times.length;i++){const v=vals[i]; if(v==null)continue;
+    const xx=sx(times[i]),yy=sy(v),top=Math.min(yy,zero),hgt=Math.max(Math.abs(yy-zero),0.6);
+    g+='<rect x="'+(xx-bw/2).toFixed(1)+'" y="'+top.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+hgt.toFixed(1)+'" rx="1" fill="'+(v>=0?'var(--grid2)':'var(--grid)')+'" opacity="0.88"/>';}
+  for(let i=0;i<=5;i++){const t=tmin+tr*i/5,xx=sx(t).toFixed(1);g+='<text class="chartx" x="'+xx+'" y="'+(h-6)+'" text-anchor="middle">'+fmtTime(t)+'</text>';}
+  svg.innerHTML=g;
+  wireChart(svg,{times,series:[{data:vals,color:cssVar('--acc'),name:'net'}],x0,x1,tmin,tmax,y0,y1,hour:false,unit:'$'});
+}
 function renderPricing(d){
   const t=d.today||{};
   if(d.plan)$('price_plan').textContent=d.plan;
@@ -1336,9 +1406,8 @@ function renderPricing(d){
   $('pr_credit').textContent=money(t.credit);
   const net=$('pr_net');net.textContent=money(t.net);net.style.color=((t.net||0)>=0?'var(--grid2)':'var(--grid)');
   $('pr_save').textContent=money(t.savings);
-  const daily=d.daily||[];
-  lineChart('chart-price',daily.map(x=>x.ts),[{data:daily.map(x=>x.net),color:COL.acc,w:2.2,name:'net'}],
-    {symmetric:true,unit:'$',yfmt:v=>'$'+Math.round(v)});
+  const series=d.series||[];
+  barChart('chart-price',series.map(x=>x.t),series.map(x=>x.net));
   const tt=d.totals||{};
   $('price_note').innerHTML='Over this range you paid <b>'+money(tt.cost)+'</b> for grid imports and earned <b>'+money(tt.credit)+'</b> in export credit → net <b>'+money(tt.net)+'</b>; your solar + battery saved you <b>'+money(tt.savings)+'</b> vs buying it all from the grid. Rates are editable PG&E EV2-A defaults ('+(d.export_mode==='nem2'?'exports credited at the TOU rate — NEM 2':'flat export rate — NEM 3')+').';
 }
@@ -1381,7 +1450,7 @@ function renderControl(st){
   document.querySelectorAll('#view-control [data-ex]').forEach(b=>b.classList.toggle('on',b.dataset.ex===st.grid_export));
   const banner=$('ctl_banner');
   if(st.control_available===false){banner.style.display='block';
-    banner.innerHTML='⚠ Local control isn\\'t enabled yet — register an RSA key on the Pi to unlock these buttons. Settings above are read-only until then.';}
+    banner.innerHTML='⚠ Control isn\\'t connected yet — finish the Tesla Fleet API setup to unlock these buttons. Settings above are read-only until then.';}
   else{banner.style.display='none';}
 }
 
@@ -1437,16 +1506,34 @@ function renderPwBar(batt,e,settings){
   }
   $('pwbar_eta').textContent=eta; $('pwbar_sub').textContent=sub;
 }
-function renderWCFlow(wc){
+// unify both chargers: Fleet (both units: power/state) + local .74 vitals (richer)
+function unifiedWC(d){
+  const fleet=d.fleet_wc||[], local=d.wc||[];
+  const byser={}; local.forEach(c=>{const ver=c.version||{}; if(ver.serial_number)byser[ver.serial_number]=c;});
+  if(fleet.length){
+    return fleet.map(f=>{
+      const loc=byser[f.serial]||null, v=(loc&&loc.vitals)||{};
+      const localpw=v.contactor_closed?Math.round((v.vehicle_current_a||0)*(v.grid_v||0)):0;
+      const power=Math.max(f.power||0, localpw);
+      const charging=power>100||v.contactor_closed===true;
+      const connected=charging||!!(f.vin&&f.vin.length)||!!v.vehicle_connected;
+      return {serial:f.serial,power,charging,connected,local:loc};
+    });
+  }
+  return local.map(c=>{const v=c.vitals||{},ver=c.version||{},charging=!!v.contactor_closed;
+    return {serial:ver.serial_number,power:charging?Math.round((v.vehicle_current_a||0)*(v.grid_v||0)):0,
+      charging,connected:!!v.vehicle_connected,local:c};});
+}
+function renderWCFlow(d){
   const el=$('wcflow'); if(!el)return;
-  if(!wc||!wc.length){el.innerHTML='';return;}
-  el.innerHTML=wc.map((c,i)=>{
-    const v=c.vitals||{},online=!!c.vitals,charging=!!v.contactor_closed,connected=!!v.vehicle_connected;
-    const pw=charging?Math.round((v.vehicle_current_a||0)*(v.grid_v||0)):0;
-    const state=!online?'offline':(charging?'Charging':(connected?'Plugged in':'Idle'));
+  const list=unifiedWC(d);
+  if(!list.length){el.innerHTML='';return;}
+  el.innerHTML=list.map((c,i)=>{
+    const charging=c.charging,connected=c.connected;
+    const state=charging?'Charging':(connected?'Plugged in':'Idle');
     return '<div class="wccard'+(charging?' charging':'')+'">'+
-      '<div class="wct">🔌 Wall Connector'+(wc.length>1?' '+(i+1):'')+'</div>'+
-      '<div class="wcp" style="color:'+(charging?'var(--car)':'var(--dim)')+'">'+(charging?kW(pw):(connected?'0 kW':'—'))+'</div>'+
+      '<div class="wct">🔌 Wall Connector'+(list.length>1?' '+(i+1):'')+'</div>'+
+      '<div class="wcp" style="color:'+(charging?'var(--car)':'var(--dim)')+'">'+(charging?kW(c.power):(connected?'0 kW':'—'))+'</div>'+
       '<div class="wcs">'+state+'</div>'+
       (charging?'<div class="wcbar"><i></i></div>':'')+'</div>';
   }).join('');
@@ -1477,7 +1564,7 @@ function render(d){
 
   renderFlow(solar,home,grid,batt,e.soc,(d.settings||{}).grid_charging);
   renderPwBar(batt,e,d.settings);
-  renderWCFlow(d.wc||[]);
+  renderWCFlow(d);
   renderOutage(d,batt,e);
 
   const gb=$('gridbadge');
@@ -1514,27 +1601,22 @@ function render(d){
       rows.map(r=>'<div class="kv"><span class="k">'+r[0]+'</span><span class="v">'+r[1]+'</span></div>').join('')+'</div>';
   }).join('');
 
-  // wall connectors (read-only local API)
-  const wc=d.wc||[];
-  $('wcs').innerHTML = wc.length ? wc.map(c=>{
-    const v=c.vitals||{}, ver=c.version||{}, lt=c.lifetime||{};
-    const online=!!c.vitals, charging=!!v.contactor_closed, connected=!!v.vehicle_connected;
-    const amps=v.vehicle_current_a||0, volts=v.grid_v||0;
-    const pw=charging?Math.round(amps*volts):0;
-    const state = !online?'offline':(charging?'⚡ Charging':(connected?'Connected (idle)':'Idle'));
+  // wall connectors — both units (Fleet) enriched with local vitals where available
+  const ulist=unifiedWC(d);
+  $('wcs').innerHTML = ulist.length ? ulist.map((c,i)=>{
+    const loc=c.local, v=(loc&&loc.vitals)||{}, ver=(loc&&loc.version)||{}, lt=(loc&&loc.lifetime)||{};
     const rows=[
-      ['Status', state],
-      ['Power', charging?W(pw):'0 W'],
-      ['Current', online&&v.vehicle_current_a!=null?amps.toFixed(1)+' A':'—'],
-      ['Grid', v.grid_v!=null?v.grid_v.toFixed(1)+' V · '+(v.grid_hz||0).toFixed(1)+' Hz':'—'],
-      ['This session', v.session_energy_wh!=null?Wh(v.session_energy_wh):'—'],
-      ['Lifetime', lt.energy_wh!=null?(lt.energy_wh/1e6).toFixed(2)+' MWh':'—'],
-      ['Charges', lt.charge_starts!=null?lt.charge_starts:'—'],
-      ['Handle temp', v.handle_temp_c!=null?v.handle_temp_c.toFixed(1)+' °C':'—'],
-      ['Firmware', ver.firmware_version?String(ver.firmware_version).split('+')[0]:'—'],
+      ['Status', c.charging?'⚡ Charging':(c.connected?'Plugged in':'Idle')],
+      ['Power', c.charging?W(c.power):'0 W'],
     ];
-    const title=(ver.serial_number?('WC '+ver.serial_number):'Wall Connector');
-    return '<div class="card"><div class="t">'+title+' · '+(c.ip||'')+'</div>'+
+    if(v.grid_v!=null)rows.push(['Grid', v.grid_v.toFixed(1)+' V · '+(v.grid_hz||0).toFixed(1)+' Hz']);
+    if(v.session_energy_wh!=null)rows.push(['This session', Wh(v.session_energy_wh)]);
+    if(lt.energy_wh!=null)rows.push(['Lifetime', (lt.energy_wh/1e6).toFixed(2)+' MWh']);
+    if(lt.charge_starts!=null)rows.push(['Charges', lt.charge_starts]);
+    if(v.handle_temp_c!=null)rows.push(['Handle temp', v.handle_temp_c.toFixed(1)+' °C']);
+    if(ver.firmware_version)rows.push(['Firmware', String(ver.firmware_version).split('+')[0]]);
+    rows.push(['Source', loc?('local · '+(loc.ip||'')):'Tesla cloud (not on LAN)']);
+    return '<div class="card"><div class="t">Wall Connector '+(i+1)+(c.serial?' · '+c.serial:'')+'</div>'+
       rows.map(r=>'<div class="kv"><span class="k">'+r[0]+'</span><span class="v">'+r[1]+'</span></div>').join('')+'</div>';
   }).join('') : '<span class="chip">no Wall Connectors found</span>';
 
