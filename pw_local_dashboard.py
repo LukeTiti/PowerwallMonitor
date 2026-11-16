@@ -22,6 +22,88 @@ GW_HOST = os.environ.get("PW_GW_HOST", "192.168.91.1")
 KEY_PATH = os.environ.get("PW_RSA_KEY", os.path.expanduser("~/.pypowerwall/tedapi_rsa_private.pem"))
 VALID_MODES = ("self_consumption", "autonomous", "backup")  # Self-Powered / Time-Based / Backup
 
+# PG&E EV2-A time-of-use rates ($/kWh) for Morgan Hill — EDIT to match your bill.
+# Override wholesale via env PW_RATES (JSON). Summer = Jun–Sep; peak 4-9pm,
+# part-peak 3-4pm & 9pm-12am, off-peak 12am-3pm.
+_DEFAULT_RATES = {
+    "plan": "PG&E EV2-A",
+    "summer_months": [6, 7, 8, 9],
+    "import": {
+        "summer": {"peak": 0.538, "part": 0.428, "off": 0.226},
+        "winter": {"peak": 0.411, "part": 0.394, "off": 0.226},
+    },
+    "export_mode": "nem2",   # "nem2" = credited at the import TOU rate; "flat" = export_flat
+    "export_flat": 0.05,     # used only when export_mode == "flat" (e.g. NEM 3 avg)
+}
+try:
+    RATES = json.loads(os.environ["PW_RATES"]) if os.environ.get("PW_RATES") else _DEFAULT_RATES
+except Exception:
+    RATES = _DEFAULT_RATES
+
+
+def _rate_period(hour):
+    if 16 <= hour <= 20:
+        return "peak"
+    if hour == 15 or 21 <= hour <= 23:
+        return "part"
+    return "off"
+
+
+def _import_rate(ts):
+    lt = time.localtime(ts)
+    season = "summer" if lt.tm_mon in RATES["summer_months"] else "winter"
+    return RATES["import"][season][_rate_period(lt.tm_hour)]
+
+
+def _export_rate(ts):
+    if RATES.get("export_mode") == "flat":
+        return RATES.get("export_flat", 0.0)
+    return _import_rate(ts)  # NEM 2: exports credited at the import TOU rate
+
+
+def pricing(range_s):
+    """$ cost/credit/savings from grid interaction, priced by TOU rate per sample."""
+    now = time.time(); start = int(now - range_s)
+    try:
+        c = db_connect()
+        rows = c.execute(
+            "SELECT ts,solar,home,grid,batt FROM samples WHERE ts>=? ORDER BY ts",
+            (start,)).fetchall()
+        c.close()
+    except Exception as e:
+        return {"error": str(e)}
+    maxgap = LOG_EVERY * 3
+    days = {}
+    tot = {"cost": 0.0, "credit": 0.0, "savings": 0.0, "import_kwh": 0.0, "export_kwh": 0.0}
+    for a, b in zip(rows, rows[1:]):
+        dt = b[0] - a[0]
+        if dt <= 0 or dt > maxgap:
+            continue
+        h = dt / 3600000.0
+        ts = a[0]; s = a[1] or 0; hm = a[2] or 0; g = a[3] or 0; bt = a[4] or 0
+        gi = max(g, 0) * h; ge = max(-g, 0) * h
+        # self-supplied to home (solar first, then battery), valued at import rate
+        S, Hd, bD = max(s, 0), max(hm, 0), max(bt, 0)
+        sh = min(S, Hd); bh = min(bD, Hd - sh)
+        selfkwh = (sh + bh) * h
+        ir = _import_rate(ts); er = _export_rate(ts)
+        cost = gi * ir; credit = ge * er; save = selfkwh * ir
+        key = time.strftime("%Y-%m-%d", time.localtime(ts))
+        d = days.setdefault(key, {"cost": 0.0, "credit": 0.0, "savings": 0.0, "ts": ts})
+        d["cost"] += cost; d["credit"] += credit; d["savings"] += save
+        tot["cost"] += cost; tot["credit"] += credit; tot["savings"] += save
+        tot["import_kwh"] += gi; tot["export_kwh"] += ge
+    tkey = time.strftime("%Y-%m-%d", time.localtime(now))
+    td = days.get(tkey, {"cost": 0, "credit": 0, "savings": 0})
+    today = {"cost": round(td["cost"], 2), "credit": round(td["credit"], 2),
+             "net": round(td["credit"] - td["cost"], 2), "savings": round(td["savings"], 2)}
+    daily = [{"ts": days[k]["ts"], "net": round(days[k]["credit"] - days[k]["cost"], 2),
+              "cost": round(days[k]["cost"], 2), "savings": round(days[k]["savings"], 2)}
+             for k in sorted(days)]
+    tot["net"] = tot["credit"] - tot["cost"]
+    return {"plan": RATES.get("plan"), "export_mode": RATES.get("export_mode"),
+            "today": today, "totals": {k: round(v, 2) for k, v in tot.items()}, "daily": daily}
+
 _data = {"ok": False, "error": "starting up", "ts": time.time()}
 _lock = threading.Lock()
 
@@ -809,6 +891,18 @@ svg.chart{cursor:crosshair}
       </div>
     </div>
     <div class="chartcard">
+      <h3>Money — <span id="price_plan">PG&amp;E EV2-A</span></h3>
+      <div class="grid kwh">
+        <div class="tile"><div class="bar" style="background:var(--grid)"></div><div class="lbl">Grid cost today</div><div class="val" id="pr_cost">—</div></div>
+        <div class="tile"><div class="bar" style="background:var(--grid2)"></div><div class="lbl">Export credit today</div><div class="val" id="pr_credit">—</div></div>
+        <div class="tile"><div class="bar" style="background:var(--acc)"></div><div class="lbl">Net grid today</div><div class="val" id="pr_net">—</div></div>
+        <div class="tile"><div class="bar" style="background:var(--solar)"></div><div class="lbl">Solar + battery saved</div><div class="val" id="pr_save">—</div></div>
+      </div>
+      <div class="statlbl" style="margin-top:14px">Net grid $ per day &nbsp;(− = you paid · + = you earned)</div>
+      <svg class="chart" id="chart-price" viewBox="0 0 640 160" preserveAspectRatio="none"></svg>
+      <div class="setnote" id="price_note"></div>
+    </div>
+    <div class="chartcard">
       <h3>Today vs a typical day</h3>
       <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px">
         <div class="tvt" id="tvt_solar"></div>
@@ -963,7 +1057,7 @@ function setView(v){
   });
   try{localStorage.setItem('pwview',v);}catch(e){}
   clearInterval(_histTimer); _histTimer=null;
-  if(v==='trends'){ loadHistory(); loadStats(); _histTimer=setInterval(()=>{loadHistory();loadStats();},30000); }
+  if(v==='trends'){ loadHistory(); loadStats(); loadPricing(); _histTimer=setInterval(()=>{loadHistory();loadStats();loadPricing();},30000); }
 }
 const THRESH=50; // W below this = "idle", line off
 function liveNode(id,on){$(id).classList.toggle('live',on);}
@@ -1047,7 +1141,7 @@ function renderFlow(solar,home,grid,batt,soc,gridChg){
 // ---------- Trends / history charts (self-contained SVG, no libs) ----------
 let _range=86400;
 function cssVar(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim()||'#888';}
-const COL={solar:cssVar('--solar'),home:cssVar('--home'),grid:cssVar('--grid'),batt:cssVar('--batt'),car:cssVar('--car')};
+const COL={solar:cssVar('--solar'),home:cssVar('--home'),grid:cssVar('--grid'),batt:cssVar('--batt'),car:cssVar('--car'),acc:cssVar('--acc')};
 function niceMax(v){if(v<=0)return 1;const p=Math.pow(10,Math.floor(Math.log10(v)));const n=v/p;const s=n<=1?1:n<=2?2:n<=5?5:10;return s*p;}
 function fmtTime(ts){const d=new Date(ts*1000),p=x=>String(x).padStart(2,'0');
   if(_range>86400)return (d.getMonth()+1)+'/'+d.getDate();
@@ -1080,7 +1174,7 @@ function chartScrub(svg,e){
   const when=cx.hour?hourLabel(idx):fmtWhen(cx.times[idx]);
   let rows='';
   (cx.series||[]).forEach(s=>{const v=(s.data||[])[idx];if(v==null)return;
-    const disp=cx.unit==='%'?Math.round(v)+'%':(v/1000).toFixed(2)+' kW';
+    const disp=cx.unit==='%'?Math.round(v)+'%':(cx.unit==='$'?(v<0?'-$':'$')+Math.abs(v).toFixed(2):(v/1000).toFixed(2)+' kW');
     rows+='<div><b style="background:'+s.color+'"></b>'+(s.name?s.name+' ':'')+disp+'</div>';});
   if(!rows)rows='<div style="color:var(--dim)">no reading</div>';
   const tp=tipEl();tp.innerHTML='<div class="ctw">'+when+'</div>'+rows;tp.style.display='block';
@@ -1233,6 +1327,23 @@ function renderStats(d){
 }
 async function loadStats(){
   try{const r=await fetch('stats.json?range='+_range,{cache:'no-store'});renderStats(await r.json());}catch(e){}
+}
+function money(v){if(v==null)return'—';return (v<0?'-$':'$')+Math.abs(v).toFixed(2);}
+function renderPricing(d){
+  const t=d.today||{};
+  if(d.plan)$('price_plan').textContent=d.plan;
+  $('pr_cost').textContent=money(t.cost);
+  $('pr_credit').textContent=money(t.credit);
+  const net=$('pr_net');net.textContent=money(t.net);net.style.color=((t.net||0)>=0?'var(--grid2)':'var(--grid)');
+  $('pr_save').textContent=money(t.savings);
+  const daily=d.daily||[];
+  lineChart('chart-price',daily.map(x=>x.ts),[{data:daily.map(x=>x.net),color:COL.acc,w:2.2,name:'net'}],
+    {symmetric:true,unit:'$',yfmt:v=>'$'+Math.round(v)});
+  const tt=d.totals||{};
+  $('price_note').innerHTML='Over this range you paid <b>'+money(tt.cost)+'</b> for grid imports and earned <b>'+money(tt.credit)+'</b> in export credit → net <b>'+money(tt.net)+'</b>; your solar + battery saved you <b>'+money(tt.savings)+'</b> vs buying it all from the grid. Rates are editable PG&E EV2-A defaults ('+(d.export_mode==='nem2'?'exports credited at the TOU rate — NEM 2':'flat export rate — NEM 3')+').';
+}
+async function loadPricing(){
+  try{const r=await fetch('pricing.json?range='+_range,{cache:'no-store'});renderPricing(await r.json());}catch(e){}
 }
 
 async function savePwd(){
@@ -1442,7 +1553,7 @@ async function load(){try{const r=await fetch('data.json',{cache:'no-store'});re
 document.querySelectorAll('#ranges .rbtn').forEach(b=>b.onclick=()=>{
   _range=+b.dataset.r;
   document.querySelectorAll('#ranges .rbtn').forEach(x=>x.classList.toggle('active',x===b));
-  loadHistory(); loadStats();
+  loadHistory(); loadStats(); loadPricing();
 });
 let _v0='flow';try{_v0=localStorage.getItem('pwview')||'flow';}catch(e){}
 setView(_v0);
@@ -1537,6 +1648,19 @@ class H(BaseHTTPRequestHandler):
             except Exception:
                 range_s = 604800
             body = json.dumps(stats(range_s)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith("/pricing.json"):
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                range_s = max(300, min(int(q.get("range", ["604800"])[0]), HISTORY_DAYS * 86400))
+            except Exception:
+                range_s = 604800
+            body = json.dumps(pricing(range_s)).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
