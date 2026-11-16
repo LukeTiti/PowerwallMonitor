@@ -1,0 +1,19 @@
+# secrets — never commit
+.env
+.pw_dashboard_secret
+.pypowerwall*
+.tesla-fleet/
+*.pem
+*_private*.pem
+
+# data / runtime
+*.db
+*.db-wal
+*.db-shm
+
+# python
+__pycache__/
+*.pyc
+venv/
+pw-tedapi-test/
+.venv/

@@ -1,0 +1,19 @@
+[Unit]
+Description=Powerwall Local Dashboard (TEDAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=luketiti
+# The gateway password is read from ~/.pw_dashboard_secret (set via the dashboard's
+# "Gateway connection" panel) or from PW_GW_PWD below. Leave blank to use the secret file.
+Environment=PW_GW_PWD=
+# Optional: comma-separated Wall Connector IPs, history retention, ports, etc.
+# Environment=PW_WC=192.168.1.74
+ExecStart=/home/luketiti/pw-tedapi-test/bin/python -u /home/luketiti/pw_local_dashboard.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
