@@ -719,6 +719,14 @@ summary{font-weight:590}
 .outage b{color:#fff;font-weight:700}
 .outage .osub{font-size:13px;margin-top:3px;opacity:.92}
 .outage .ocrit{font-size:13.5px;margin-top:9px;font-weight:600;line-height:1.4}
+svg.chart{cursor:crosshair}
+.xhair{stroke:var(--txt);stroke-width:1;opacity:.45;stroke-dasharray:3 3;pointer-events:none}
+#ctip{position:fixed;z-index:60;pointer-events:none;display:none;background:rgba(28,28,30,0.94);
+  border:0.5px solid var(--line);border-radius:11px;padding:8px 11px;font-size:12.5px;color:var(--txt);
+  backdrop-filter:blur(18px) saturate(160%);-webkit-backdrop-filter:blur(18px) saturate(160%);box-shadow:0 10px 30px rgba(0,0,0,0.45)}
+#ctip .ctw{color:var(--dim);font-size:11px;margin-bottom:4px}
+#ctip b{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;vertical-align:middle}
+#ctip div{line-height:1.5;font-variant-numeric:tabular-nums}
 </style></head>
 <body><div class="wrap">
 <header>
@@ -1042,7 +1050,43 @@ function cssVar(v){return getComputedStyle(document.documentElement).getProperty
 const COL={solar:cssVar('--solar'),home:cssVar('--home'),grid:cssVar('--grid'),batt:cssVar('--batt'),car:cssVar('--car')};
 function niceMax(v){if(v<=0)return 1;const p=Math.pow(10,Math.floor(Math.log10(v)));const n=v/p;const s=n<=1?1:n<=2?2:n<=5?5:10;return s*p;}
 function fmtTime(ts){const d=new Date(ts*1000),p=x=>String(x).padStart(2,'0');
-  return _range<=86400?p(d.getHours())+':'+p(d.getMinutes()):(d.getMonth()+1)+'/'+d.getDate();}
+  if(_range>86400)return (d.getMonth()+1)+'/'+d.getDate();
+  let h=d.getHours(),ap=h<12?'a':'p';h=h%12||12;const m=d.getMinutes();
+  return h+(m?':'+p(m):'')+ap;}
+// ---- drag / hover to read a chart's values at a point ----
+let _ctip;
+function tipEl(){if(!_ctip){_ctip=document.createElement('div');_ctip.id='ctip';document.body.appendChild(_ctip);}return _ctip;}
+function hideTip(svg){tipEl().style.display='none';if(svg){const c=svg.querySelector('.xhair');if(c)c.remove();}}
+function nearestIdx(a,t){const n=a.length;if(t<=a[0])return 0;if(t>=a[n-1])return n-1;let lo=0,hi=n-1;
+  while(hi-lo>1){const m=(lo+hi)>>1;if(a[m]<t)lo=m;else hi=m;}return (t-a[lo]<=a[hi]-t)?lo:hi;}
+function hourLabel(h){return (h%12||12)+' '+(h<12?'AM':'PM');}
+function wireChart(svg,cx){svg._cx=cx;
+  if(svg._wired)return;svg._wired=true;
+  const mv=e=>chartScrub(svg,e);
+  svg.addEventListener('pointermove',mv);
+  svg.addEventListener('pointerdown',mv);
+  svg.addEventListener('pointerleave',()=>hideTip(svg));
+}
+function chartScrub(svg,e){
+  const cx=svg._cx;if(!cx||!cx.times||cx.times.length<1)return;
+  const vb=svg.viewBox.baseVal,rect=svg.getBoundingClientRect();if(!rect.width)return;
+  const px=(e.clientX-rect.left)/rect.width*vb.width;
+  let idx,xx;
+  if(cx.hour){let f=(px-cx.x0)/(cx.x1-cx.x0);f=Math.max(0,Math.min(1,f));idx=Math.round(f*23);xx=cx.x0+idx/23*(cx.x1-cx.x0);}
+  else{const t=cx.tmin+(px-cx.x0)/(cx.x1-cx.x0)*(cx.tmax-cx.tmin);idx=nearestIdx(cx.times,t);xx=cx.x0+(cx.times[idx]-cx.tmin)/((cx.tmax-cx.tmin)||1)*(cx.x1-cx.x0);}
+  let ln=svg.querySelector('.xhair');
+  if(!ln){ln=document.createElementNS('http://www.w3.org/2000/svg','line');ln.setAttribute('class','xhair');svg.appendChild(ln);}
+  ln.setAttribute('x1',xx.toFixed(1));ln.setAttribute('x2',xx.toFixed(1));ln.setAttribute('y1',cx.y1);ln.setAttribute('y2',cx.y0);
+  const when=cx.hour?hourLabel(idx):fmtWhen(cx.times[idx]);
+  let rows='';
+  (cx.series||[]).forEach(s=>{const v=(s.data||[])[idx];if(v==null)return;
+    const disp=cx.unit==='%'?Math.round(v)+'%':(v/1000).toFixed(2)+' kW';
+    rows+='<div><b style="background:'+s.color+'"></b>'+(s.name?s.name+' ':'')+disp+'</div>';});
+  if(!rows)rows='<div style="color:var(--dim)">no reading</div>';
+  const tp=tipEl();tp.innerHTML='<div class="ctw">'+when+'</div>'+rows;tp.style.display='block';
+  tp.style.left=Math.max(6,Math.min(e.clientX+14,window.innerWidth-160))+'px';
+  tp.style.top=(e.clientY+16)+'px';
+}
 
 function lineChart(svgId,times,lines,opt){
   const svg=$(svgId),vb=svg.viewBox.baseVal,w=vb.width,h=vb.height;
@@ -1077,6 +1121,7 @@ function lineChart(svgId,times,lines,opt){
     g+='<path d="'+dAttr+'" fill="none" stroke="'+L.color+'" stroke-width="'+(L.w||1.6)+
        '" stroke-linejoin="round" stroke-linecap="round" opacity="'+(L.op||1)+'"/>';});
   svg.innerHTML=g;
+  wireChart(svg,{times,series:lines,x0,x1,tmin,tmax,y0,y1,hour:false,unit:opt.unit||'kW'});
 }
 
 // parts: [centerName, value, color, legendLabel]
@@ -1107,8 +1152,8 @@ function drawTrends(d){
   lineChart('chart-grid', t,[{data:d.grid||[], color:COL.grid, w:1.8}],{symmetric:true,yfmt:kwf});
   lineChart('chart-batt', t,[{data:d.batt||[], color:COL.batt, w:1.8}],{symmetric:true,yfmt:kwf});
   lineChart('chart-wc',   t,[{data:d.wc||[],   color:COL.car,  w:1.8,area:true}],{ymin:0,yfmt:kwf});
-  lineChart('chart-soc',t,[{data:d.soc||[],color:COL.batt,w:2,area:true}],
-    {ymin:0,ymax:100,yfmt:v=>Math.round(v)+''});
+  lineChart('chart-soc',t,[{data:d.soc||[],color:COL.batt,w:2,area:true,name:'charge'}],
+    {ymin:0,ymax:100,unit:'%',yfmt:v=>Math.round(v)+''});
   const k=d.kwh||{},kwh=x=>x==null?'—':x.toFixed(1)+' kWh';
   $('k_solar').textContent=kwh(k.solar); $('k_home').textContent=kwh(k.home);
   $('k_bchg').textContent=kwh(k.batt_charge); $('k_bdis').textContent=kwh(k.batt_discharge);
@@ -1145,6 +1190,7 @@ function profileChart(svgId,lines){
     for(let i=0;i<24;i++){const v=data[i];if(v==null){pen=false;continue;}d+=(pen?'L':'M')+sx(i).toFixed(1)+','+sy(v).toFixed(1)+' ';pen=true;}
     g+='<path d="'+d+'" fill="none" stroke="'+L.color+'" stroke-width="'+(L.w||1.8)+'" stroke-linejoin="round" stroke-linecap="round" opacity="'+(L.op||1)+'"'+(L.dash?' stroke-dasharray="4 4"':'')+'/>';});
   svg.innerHTML=g;
+  wireChart(svg,{times:Array.from({length:24},(_,i)=>i),series:lines,x0,x1,y0,y1,hour:true,unit:'kW'});
 }
 function fmtWhen(ts){if(!ts)return'';const d=new Date(ts*1000),p=x=>String(x).padStart(2,'0');
   let hh=d.getHours(),ap=hh<12?'AM':'PM';hh=hh%12||12;return hh+':'+p(d.getMinutes())+' '+ap+' · '+(d.getMonth()+1)+'/'+d.getDate();}
@@ -1182,8 +1228,8 @@ function renderStats(d){
   tvtTile($('tvt_solar'),'☀️ Solar',ty.solar_kwh,ty.typical_solar_sofar,ty.vs_solar_pct,ready);
   tvtTile($('tvt_home'),'🏠 Home',ty.home_kwh,ty.typical_home_sofar,ty.vs_home_pct,ready);
   const p=d.profile||{};
-  profileChart('chart-prof-solar',[{data:p.solar,color:COL.solar,w:1.6,op:.45,dash:true},{data:ty.profile_solar,color:COL.solar,w:2.4}]);
-  profileChart('chart-prof-home', [{data:p.home, color:COL.home, w:1.6,op:.45,dash:true},{data:ty.profile_home, color:COL.home, w:2.4}]);
+  profileChart('chart-prof-solar',[{data:p.solar,color:COL.solar,w:1.6,op:.45,dash:true,name:'typical'},{data:ty.profile_solar,color:COL.solar,w:2.4,name:'today'}]);
+  profileChart('chart-prof-home', [{data:p.home, color:COL.home, w:1.6,op:.45,dash:true,name:'typical'},{data:ty.profile_home, color:COL.home, w:2.4,name:'today'}]);
 }
 async function loadStats(){
   try{const r=await fetch('stats.json?range='+_range,{cache:'no-store'});renderStats(await r.json());}catch(e){}
