@@ -186,7 +186,7 @@ def history(start, end):
         if dt <= 0 or dt > maxgap:
             continue
         h = dt / 3600000.0  # Wh -> kWh (seconds/3600 /1000)
-        s, hm, g, bt = a[1] or 0, a[2] or 0, a[3] or 0, a[4] or 0
+        s, hm, g, bt = a[1] or 0, max(a[2] or 0, 0), a[3] or 0, a[4] or 0
         kwh["solar"] += max(s, 0) * h
         kwh["home"] += hm * h
         kwh["grid_in"] += max(g, 0) * h
@@ -218,7 +218,7 @@ def history(start, end):
             ts = r[0]
             k = int((ts - start) / bucket)
             d = agg.setdefault(k, [0, 0, 0, 0, 0, 0.0, 0, 0, 0])  # sums+count+socN+wc
-            d[0] += ts; d[1] += r[1] or 0; d[2] += r[2] or 0; d[3] += r[3] or 0
+            d[0] += ts; d[1] += r[1] or 0; d[2] += max(r[2] or 0, 0); d[3] += r[3] or 0
             d[4] += r[4] or 0
             if r[5] is not None:
                 d[5] += r[5]; d[7] += 1
@@ -237,7 +237,7 @@ def history(start, end):
             out["wc"].append(round(d[8] / n))
     else:
         out = {"t": [r[0] for r in rows], "solar": [r[1] for r in rows],
-               "home": [r[2] for r in rows], "grid": [r[3] for r in rows],
+               "home": [max(r[2] or 0, 0) for r in rows], "grid": [r[3] for r in rows],
                "batt": [r[4] for r in rows], "soc": [r[5] for r in rows],
                "wc": [(r[6] if len(r) > 6 and r[6] is not None else 0) for r in rows]}
     out["kwh"] = kwh
@@ -346,7 +346,7 @@ def stats(start, end):
             if 0 < dt <= maxgap:
                 h = dt / 3600000.0; p = trows[i - 1]
                 tkwh["solar"] += max(p[1] or 0, 0) * h
-                tkwh["home"] += (p[2] or 0) * h
+                tkwh["home"] += max(p[2] or 0, 0) * h
     profile = {k: [round(a / n) if n else None for a, n in prof[k]] for k in prof}
     out["profile"] = profile
     out["baseline_days"] = len(prior_dates)
@@ -518,6 +518,10 @@ def poller():
                 loc = m.get("location")
                 if loc:
                     flows[loc] = round(float(m.get("realPowerW", 0)))
+            # Home (LOAD) can't be negative; Tesla's derived value dips slightly
+            # negative when the CTs don't perfectly sum during fast swings.
+            if flows.get("LOAD", 0) < 0:
+                flows["LOAD"] = 0
             cache["flows"] = flows
             ss = ctrl.get("systemStatus", {})
             rem = ss.get("nominalEnergyRemainingWh")
