@@ -63,14 +63,14 @@ def _export_rate(ts):
     return _import_rate(ts)  # NEM 2: exports credited at the import TOU rate
 
 
-def pricing(range_s):
+def pricing(start, end):
     """$ cost/credit/savings from grid interaction, priced by TOU rate per sample."""
-    now = time.time(); start = int(now - range_s)
+    range_s = max(1, end - start)
     try:
         c = db_connect()
         rows = c.execute(
-            "SELECT ts,solar,home,grid,batt FROM samples WHERE ts>=? ORDER BY ts",
-            (start,)).fetchall()
+            "SELECT ts,solar,home,grid,batt FROM samples WHERE ts>=? AND ts<? ORDER BY ts",
+            (start, end)).fetchall()
         c.close()
     except Exception as e:
         return {"error": str(e)}
@@ -98,7 +98,7 @@ def pricing(range_s):
         tot["import_kwh"] += gi; tot["export_kwh"] += ge
         bk = buckets.setdefault(int((ts - start) / bucket_s), {"t": 0, "n": 0, "net": 0.0})
         bk["t"] += ts; bk["n"] += 1; bk["net"] += (credit - cost)
-    tkey = time.strftime("%Y-%m-%d", time.localtime(now))
+    tkey = time.strftime("%Y-%m-%d", time.localtime(end - 1))
     td = days.get(tkey, {"cost": 0, "credit": 0, "savings": 0})
     today = {"cost": round(td["cost"], 2), "credit": round(td["credit"], 2),
              "net": round(td["credit"] - td["cost"], 2), "savings": round(td["savings"], 2)}
@@ -163,15 +163,14 @@ def db_init():
     c.close()
 
 
-def history(range_s):
-    """Return downsampled series + integrated kWh totals for the last range_s seconds."""
-    now = time.time()
-    start = int(now - range_s)
+def history(start, end):
+    """Downsampled series + integrated kWh totals for the window [start, end)."""
+    range_s = max(1, end - start)
     try:
         c = db_connect()
         rows = c.execute(
-            "SELECT ts,solar,home,grid,batt,soc,wc FROM samples WHERE ts>=? ORDER BY ts",
-            (start,)).fetchall()
+            "SELECT ts,solar,home,grid,batt,soc,wc FROM samples WHERE ts>=? AND ts<? ORDER BY ts",
+            (start, end)).fetchall()
         c.close()
     except Exception as e:
         return {"error": str(e), "t": []}
@@ -247,141 +246,125 @@ def history(range_s):
     return out
 
 
-def stats(range_s):
-    """Records, milestones, and a typical-day hour profile over the last range_s."""
+def stats(start, end):
+    """Window records + milestones, plus a LIVE today-vs-typical (independent of window)."""
     now = time.time()
-    start = int(now - range_s)
+    range_s = max(1, end - start)
+    maxgap = LOG_EVERY * 3
     try:
         c = db_connect()
         rows = c.execute(
-            "SELECT ts,solar,home,grid,batt,soc,wc FROM samples WHERE ts>=? ORDER BY ts",
-            (start,)).fetchall()
+            "SELECT ts,solar,home,grid,batt,soc,wc FROM samples WHERE ts>=? AND ts<? ORDER BY ts",
+            (start, end)).fetchall()
         c.close()
     except Exception as e:
         return {"error": str(e), "n": 0}
     out = {"range": range_s, "n": len(rows)}
-    if not rows:
-        return out
 
-    # peak records (value + when)
-    def peak(idx, sign=1):
-        best = None
-        for r in rows:
-            v = r[idx]
-            if v is None:
-                continue
-            sv = v * sign
-            if best is None or sv > best[0]:
-                best = (sv, r[0])
-        return {"w": round(best[0]), "ts": best[1]} if best else None
-    rec = {
-        "peak_solar": peak(1),
-        "peak_home": peak(2),
-        "peak_grid_imp": peak(3, 1),
-        "peak_grid_exp": peak(3, -1),
-        "peak_batt_dis": peak(4, 1),
-        "peak_batt_chg": peak(4, -1),
-    }
-    socs = [(r[5], r[0]) for r in rows if r[5] is not None]
-    if socs:
-        hi = max(socs); lo = min(socs)
-        rec["max_soc"] = {"v": hi[0], "ts": hi[1]}
-        rec["min_soc"] = {"v": lo[0], "ts": lo[1]}
-    out["records"] = rec
+    if rows:
+        def peak(idx, sign=1):
+            best = None
+            for r in rows:
+                v = r[idx]
+                if v is None:
+                    continue
+                sv = v * sign
+                if best is None or sv > best[0]:
+                    best = (sv, r[0])
+            return {"w": round(best[0]), "ts": best[1]} if best else None
+        rec = {"peak_solar": peak(1), "peak_home": peak(2),
+               "peak_grid_imp": peak(3, 1), "peak_grid_exp": peak(3, -1),
+               "peak_batt_dis": peak(4, 1), "peak_batt_chg": peak(4, -1)}
+        socs = [(r[5], r[0]) for r in rows if r[5] is not None]
+        if socs:
+            hi = max(socs); lo = min(socs)
+            rec["max_soc"] = {"v": hi[0], "ts": hi[1]}
+            rec["min_soc"] = {"v": lo[0], "ts": lo[1]}
+        out["records"] = rec
+        kwh = {"solar": 0.0, "home": 0.0, "batt_dis": 0.0, "car": 0.0, "grid_in": 0.0}
+        for i in range(1, len(rows)):
+            dt = rows[i][0] - rows[i - 1][0]
+            if 0 < dt <= maxgap:
+                h = dt / 3600000.0; p = rows[i - 1]
+                kwh["solar"] += max(p[1] or 0, 0) * h
+                kwh["home"] += (p[2] or 0) * h
+                kwh["grid_in"] += max(p[3] or 0, 0) * h
+                kwh["batt_dis"] += max(p[4] or 0, 0) * h
+                kwh["car"] += (p[6] or 0) * h
+        pack = 43.2
+        try:
+            with _lock:
+                fw = (_data.get("energy") or {}).get("fullWh")
+            if fw:
+                pack = fw / 1000.0
+        except Exception:
+            pass
+        wdays = max((rows[-1][0] - rows[0][0]) / 86400.0, 1e-6)
+        out["totals"] = {
+            "solar_kwh": round(kwh["solar"], 1), "home_kwh": round(kwh["home"], 1),
+            "car_kwh": round(kwh["car"], 1),
+            "equiv_cycles": round(kwh["batt_dis"] / pack, 1) if pack else None,
+            "co2_kg": round(kwh["solar"] * 0.39),
+            "trees": round(kwh["solar"] * 0.39 / 21.77, 1),
+            "ev_miles": round(kwh["solar"] / 0.25),
+            "avg_solar_day": round(kwh["solar"] / wdays, 1) if wdays >= 1 else None,
+            "self_powered_pct": round(kwh["solar"] / (kwh["solar"] + kwh["grid_in"]) * 100)
+            if (kwh["solar"] + kwh["grid_in"]) > 0 else None,
+        }
 
-    # The typical-day profile is built from PRIOR days only (ts before today's
-    # local midnight), so "today vs typical" compares today against OTHER days,
-    # never itself. Totals/milestones still integrate over everything.
+    # ---- LIVE today-vs-typical, from a recent lookback (independent of window) ----
+    try:
+        c = db_connect()
+        rrows = c.execute(
+            "SELECT ts,solar,home FROM samples WHERE ts>=? ORDER BY ts",
+            (int(now - 16 * 86400),)).fetchall()
+        c.close()
+    except Exception:
+        rrows = []
     lt = time.localtime(now)
     midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
-    prof = {k: [[0.0, 0] for _ in range(24)] for k in ("solar", "home", "grid", "batt", "wc")}
-    kwh = {"solar": 0.0, "home": 0.0, "batt_dis": 0.0, "batt_chg": 0.0,
-           "car": 0.0, "grid_in": 0.0, "grid_out": 0.0}
-    prior_dates = set()
-    maxgap = LOG_EVERY * 3
-    for i, r in enumerate(rows):
-        if r[0] < midnight:  # prior days only feed the "typical" baseline
-            prior_dates.add(time.localtime(r[0])[0:3])
-            hr = time.localtime(r[0]).tm_hour
-            for j, k in ((1, "solar"), (2, "home"), (3, "grid"), (4, "batt"), (6, "wc")):
-                v = r[j]
-                if v is not None:
-                    prof[k][hr][0] += v; prof[k][hr][1] += 1
-        if i > 0:
-            dt = r[0] - rows[i - 1][0]
-            if 0 < dt <= maxgap:
-                h = dt / 3600000.0
-                p = rows[i - 1]
-                s, hm, g, bt, wc = p[1] or 0, p[2] or 0, p[3] or 0, p[4] or 0, p[6] or 0
-                kwh["solar"] += max(s, 0) * h; kwh["home"] += hm * h
-                kwh["batt_dis"] += max(bt, 0) * h; kwh["batt_chg"] += max(-bt, 0) * h
-                kwh["grid_in"] += max(g, 0) * h; kwh["grid_out"] += max(-g, 0) * h
-                kwh["car"] += wc * h
-    out["profile"] = {k: [round(a / n) if n else None for a, n in prof[k]] for k in prof}
-    out["baseline_days"] = len(prior_dates)
-
-    # fun milestones
-    pack = 43.2
-    try:
-        with _lock:
-            fw = (_data.get("energy") or {}).get("fullWh")
-        if fw:
-            pack = fw / 1000.0
-    except Exception:
-        pass
-    days = max((rows[-1][0] - rows[0][0]) / 86400.0, 1e-6)
-    out["totals"] = {
-        "solar_kwh": round(kwh["solar"], 1),
-        "home_kwh": round(kwh["home"], 1),
-        "batt_dis_kwh": round(kwh["batt_dis"], 1),
-        "batt_chg_kwh": round(kwh["batt_chg"], 1),
-        "car_kwh": round(kwh["car"], 1),
-        "grid_in_kwh": round(kwh["grid_in"], 1),
-        "grid_out_kwh": round(kwh["grid_out"], 1),
-        "equiv_cycles": round(kwh["batt_dis"] / pack, 1) if pack else None,
-        "co2_kg": round(kwh["solar"] * 0.39),            # ~0.39 kg CO2 / kWh (US grid avg)
-        "trees": round(kwh["solar"] * 0.39 / 21.77, 1),  # ~21.77 kg CO2 / tree / yr
-        "ev_miles": round(kwh["solar"] / 0.25),          # ~0.25 kWh / mile
-        "avg_solar_day": round(kwh["solar"] / days, 1) if days >= 1 else None,
-        "avg_home_day": round(kwh["home"] / days, 1) if days >= 1 else None,
-        "self_powered_pct": round(kwh["solar"] / (kwh["solar"] + kwh["grid_in"]) * 100)
-        if (kwh["solar"] + kwh["grid_in"]) > 0 else None,
-    }
-
-    # today-so-far vs a typical day (lt/midnight computed above)
+    prof = {k: [[0.0, 0] for _ in range(24)] for k in ("solar", "home")}
     tprof = {k: [[0.0, 0] for _ in range(24)] for k in ("solar", "home")}
     tkwh = {"solar": 0.0, "home": 0.0}
-    trows = [r for r in rows if r[0] >= midnight]
+    prior_dates = set(); trows = []
+    for r in rrows:
+        if r[0] < midnight:
+            prior_dates.add(time.localtime(r[0])[0:3])
+            hr = time.localtime(r[0]).tm_hour
+            for j, k in ((1, "solar"), (2, "home")):
+                if r[j] is not None:
+                    prof[k][hr][0] += r[j]; prof[k][hr][1] += 1
+        else:
+            trows.append(r)
     for i, r in enumerate(trows):
         hr = time.localtime(r[0]).tm_hour
         for j, k in ((1, "solar"), (2, "home")):
-            v = r[j]
-            if v is not None:
-                tprof[k][hr][0] += v; tprof[k][hr][1] += 1
+            if r[j] is not None:
+                tprof[k][hr][0] += r[j]; tprof[k][hr][1] += 1
         if i > 0:
             dt = r[0] - trows[i - 1][0]
             if 0 < dt <= maxgap:
                 h = dt / 3600000.0; p = trows[i - 1]
                 tkwh["solar"] += max(p[1] or 0, 0) * h
                 tkwh["home"] += (p[2] or 0) * h
+    profile = {k: [round(a / n) if n else None for a, n in prof[k]] for k in prof}
+    out["profile"] = profile
+    out["baseline_days"] = len(prior_dates)
     cur_h = lt.tm_hour + lt.tm_min / 60.0
 
-    def typical_so_far(profile_list):
-        tot = 0.0
+    def typ(plist):
+        tt = 0.0
         for hh in range(24):
-            v = profile_list[hh]
+            v = plist[hh]
             if v is None:
                 continue
             frac = 1.0 if hh < int(cur_h) else (cur_h - hh if hh == int(cur_h) else 0.0)
-            tot += v * max(frac, 0.0)
-        return tot / 1000.0
-    tsol = typical_so_far(out["profile"]["solar"])
-    thom = typical_so_far(out["profile"]["home"])
+            tt += v * max(frac, 0.0)
+        return tt / 1000.0
+    tsol = typ(profile["solar"]); thom = typ(profile["home"])
     out["today"] = {
-        "solar_kwh": round(tkwh["solar"], 1),
-        "home_kwh": round(tkwh["home"], 1),
-        "typical_solar_sofar": round(tsol, 1),
-        "typical_home_sofar": round(thom, 1),
+        "solar_kwh": round(tkwh["solar"], 1), "home_kwh": round(tkwh["home"], 1),
+        "typical_solar_sofar": round(tsol, 1), "typical_home_sofar": round(thom, 1),
         "vs_solar_pct": round((tkwh["solar"] - tsol) / tsol * 100) if tsol > 0.2 else None,
         "vs_home_pct": round((tkwh["home"] - thom) / thom * 100) if thom > 0.2 else None,
         "profile_solar": [round(a / n) if n else None for a, n in tprof["solar"]],
@@ -738,7 +721,9 @@ text.sub2{fill:var(--dim);font-size:10px}
 .pwbar-res{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--grid)}
 .pwbar-res::after{content:'reserve';position:absolute;top:-15px;left:50%;transform:translateX(-50%);font-size:9px;color:var(--grid);white-space:nowrap}
 .pwbar-sub{font-size:12px;color:var(--dim);margin-top:7px;text-align:center}
-.ranges{display:inline-flex;gap:4px;flex-wrap:wrap;margin:2px 0 6px}
+.ranges{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:2px 0 10px}
+.winlabel{font-weight:700;font-size:14px;letter-spacing:-0.01em;min-width:120px;text-align:center}
+.navbtn{font-size:14px;padding:5px 12px;line-height:1}
 .rbtn{background:var(--card);border:1px solid var(--line);color:var(--dim);padding:5px 12px;border-radius:8px;font-size:12px;cursor:pointer;font-weight:600;font-family:inherit}
 .rbtn.active{background:var(--card2);color:var(--txt);border-color:var(--acc)}
 .chartcard{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 10px 8px;margin-bottom:14px}
@@ -926,10 +911,15 @@ svg.chart{cursor:crosshair}
 
 <div id="view-trends" hidden>
   <div class="ranges" id="ranges">
-    <button class="rbtn" data-r="21600">6 h</button>
-    <button class="rbtn active" data-r="86400">24 h</button>
-    <button class="rbtn" data-r="604800">7 d</button>
-    <button class="rbtn" data-r="2592000">30 d</button>
+    <span class="toggle" id="grans">
+      <button class="tbtn active" data-g="day">Day</button>
+      <button class="tbtn" data-g="week">Week</button>
+      <button class="tbtn" data-g="month">Month</button>
+    </span>
+    <span style="flex:1"></span>
+    <button class="rbtn navbtn" id="navPrev" title="earlier">◀</button>
+    <span class="winlabel" id="winLabel">Today</span>
+    <button class="rbtn navbtn" id="navNext" title="later">▶</button>
   </div>
   <div id="trends-body">
     <div class="chartcard">
@@ -945,9 +935,9 @@ svg.chart{cursor:crosshair}
     <div class="chartcard">
       <h3>Money — <span id="price_plan">PG&amp;E EV2-A</span></h3>
       <div class="grid kwh">
-        <div class="tile"><div class="bar" style="background:var(--grid)"></div><div class="lbl">Grid cost today</div><div class="val" id="pr_cost">—</div></div>
-        <div class="tile"><div class="bar" style="background:var(--grid2)"></div><div class="lbl">Export credit today</div><div class="val" id="pr_credit">—</div></div>
-        <div class="tile"><div class="bar" style="background:var(--acc)"></div><div class="lbl">Net grid today</div><div class="val" id="pr_net">—</div></div>
+        <div class="tile"><div class="bar" style="background:var(--grid)"></div><div class="lbl">Grid cost</div><div class="val" id="pr_cost">—</div></div>
+        <div class="tile"><div class="bar" style="background:var(--grid2)"></div><div class="lbl">Export credit</div><div class="val" id="pr_credit">—</div></div>
+        <div class="tile"><div class="bar" style="background:var(--acc)"></div><div class="lbl">Net grid</div><div class="val" id="pr_net">—</div></div>
         <div class="tile"><div class="bar" style="background:var(--solar)"></div><div class="lbl">Solar + battery saved</div><div class="val" id="pr_save">—</div></div>
       </div>
       <div class="statlbl" style="margin-top:14px">Money in/out across this window &nbsp;(<span style="color:var(--grid2)">green = earning</span> · <span style="color:var(--grid)">red = paying</span>) — drag to read</div>
@@ -1107,7 +1097,7 @@ function setView(v){
   });
   try{localStorage.setItem('pwview',v);}catch(e){}
   clearInterval(_histTimer); _histTimer=null;
-  if(v==='trends'){ loadHistory(); loadStats(); loadPricing(); _histTimer=setInterval(()=>{loadHistory();loadStats();loadPricing();},30000); }
+  if(v==='trends'){ applyWindow(); _histTimer=setInterval(()=>{loadHistory();loadStats();loadPricing();},30000); }
 }
 const THRESH=50; // W below this = "idle", line off
 function liveNode(id,on){$(id).classList.toggle('live',on);}
@@ -1159,28 +1149,24 @@ function renderFlow(solar,home,grid,batt,soc,gridChg){
   $('n_grid_s').textContent = grid>THRESH?'importing':(grid<-THRESH?'exporting':'idle');
   $('n_batt_s').textContent = (soc!=null?soc+'%':'') + (batt<-THRESH?' · charging':(batt>THRESH?' · discharging':' · idle'));
   const flows=computeFlows(solar,home,grid,batt,gridChg);
-  // Each flow is ONE continuous path source -> hub -> destination with a single
-  // animation, so its dots line up evenly the whole way (like the Tesla app).
-  // When a source feeds several places, or a place is fed by several sources,
-  // the paths fan into side-by-side lanes so colours sit next to each other.
-  const groups={};
-  flows.forEach(fl=>{(groups[fl.sc]=groups[fl.sc]||[]).push(fl);(groups[fl.sk]=groups[fl.sk]||[]).push(fl);});
-  for(const node in groups){const arr=groups[node];
-    arr.forEach((fl,i)=>{const off=(i-(arr.length-1)/2)*LANE;
-      if(fl.sc===node)fl.offS=off; if(fl.sk===node)fl.offK=off;});}
+  // Lane ONLY at the destination end. Flows from the same source share the trunk
+  // (source -> hub) as one line and split at the hub toward each destination; two
+  // sources feeding one place arrive in side-by-side lanes. Uniform dot speed so
+  // the shared trunk's dots overlap cleanly and line up the whole way.
+  const sinks={};
+  flows.forEach(fl=>{(sinks[fl.sk]=sinks[fl.sk]||[]).push(fl);});
+  for(const sk in sinks){const arr=sinks[sk];
+    arr.forEach((fl,i)=>fl.offK=(i-(arr.length-1)/2)*LANE);}
   let g='';
   flows.forEach(fl=>{
-    const w=Math.max(2,Math.min(5.5,2+fl.w/1600));
-    const dur=Math.max(0.7,Math.min(3.2,1.8/(fl.w/1000+0.2)));
-    const ps=PERP[fl.sc],pk=PERP[fl.sk],oS=fl.offS||0,oK=fl.offK||0;
+    const w=Math.max(2,Math.min(6,2+fl.w/1500));   // thickness = kW
+    const pk=PERP[fl.sk],oK=fl.offK||0;
     const S=POS[fl.sc],K=POS[fl.sk],H=POS.hub;
-    const x1=S[0]+ps[0]*oS,y1=S[1]+ps[1]*oS;   // source node (its lane)
-    const x2=H[0]+ps[0]*oS,y2=H[1]+ps[1]*oS;    // reach hub in the source lane
-    const x3=H[0]+pk[0]*oK,y3=H[1]+pk[1]*oK;    // cross to the destination lane
-    const x4=K[0]+pk[0]*oK,y4=K[1]+pk[1]*oK;    // destination node (its lane)
-    const d='M'+x1+','+y1+' L'+x2+','+y2+' L'+x3+','+y3+' L'+x4+','+y4;
+    const x3=H[0]+pk[0]*oK,y3=H[1]+pk[1]*oK;   // enter the destination's lane at the hub
+    const x4=K[0]+pk[0]*oK,y4=K[1]+pk[1]*oK;   // destination (its lane)
+    const d='M'+S[0]+','+S[1]+' L'+H[0]+','+H[1]+' L'+x3+','+y3+' L'+x4+','+y4;
     g+='<path class="route" style="stroke:var(--'+fl.sc+');stroke-width:'+w.toFixed(1)+
-       ';animation-duration:'+dur.toFixed(2)+'s" d="'+d+'"/>';
+       ';animation-duration:1.3s" d="'+d+'"/>';
   });
   $('routes').innerHTML=g;
   const act={}; flows.forEach(fl=>{act[fl.sc]=1; act[fl.sk]=1;});
@@ -1189,12 +1175,33 @@ function renderFlow(solar,home,grid,batt,soc,gridChg){
 }
 
 // ---------- Trends / history charts (self-contained SVG, no libs) ----------
-let _range=86400;
+let _gran='day', _offset=0;   // offset = periods back (0 = current)
+function computeWindow(){
+  const now=new Date(); let start,end,label;
+  if(_gran==='day'){
+    start=new Date(now); start.setHours(0,0,0,0); start.setDate(start.getDate()-_offset);
+    end=new Date(start); end.setDate(end.getDate()+1);
+    label=_offset===0?'Today':(_offset===1?'Yesterday':start.toLocaleDateString(undefined,{weekday:'short',month:'short',day:'numeric'}));
+  }else if(_gran==='week'){
+    start=new Date(now); start.setHours(0,0,0,0);
+    const dow=(start.getDay()+6)%7; start.setDate(start.getDate()-dow-_offset*7);
+    end=new Date(start); end.setDate(end.getDate()+7);
+    const le=new Date(end); le.setDate(le.getDate()-1);
+    label=start.toLocaleDateString(undefined,{month:'short',day:'numeric'})+' – '+le.toLocaleDateString(undefined,{month:'short',day:'numeric'});
+  }else{
+    start=new Date(now.getFullYear(), now.getMonth()-_offset, 1);
+    end=new Date(start.getFullYear(), start.getMonth()+1, 1);
+    label=start.toLocaleDateString(undefined,{month:'long',year:'numeric'});
+  }
+  return {start:Math.floor(start.getTime()/1000), end:Math.floor(end.getTime()/1000), span:(end-start)/1000, label};
+}
+let _win=computeWindow();
+function _qs(){return 'start='+_win.start+'&end='+_win.end;}
 function cssVar(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim()||'#888';}
 const COL={solar:cssVar('--solar'),home:cssVar('--home'),grid:cssVar('--grid'),batt:cssVar('--batt'),car:cssVar('--car'),acc:cssVar('--acc')};
 function niceMax(v){if(v<=0)return 1;const p=Math.pow(10,Math.floor(Math.log10(v)));const n=v/p;const s=n<=1?1:n<=2?2:n<=5?5:10;return s*p;}
 function fmtTime(ts){const d=new Date(ts*1000),p=x=>String(x).padStart(2,'0');
-  if(_range>86400)return (d.getMonth()+1)+'/'+d.getDate();
+  if(_win.span>90000)return (d.getMonth()+1)+'/'+d.getDate();
   let h=d.getHours(),ap=h<12?'a':'p';h=h%12||12;const m=d.getMinutes();
   return h+(m?':'+p(m):'')+ap;}
 // ---- drag / hover to read a chart's values at a point ----
@@ -1314,7 +1321,7 @@ function drawTrends(d){
     donut('Grid to',[['home',hg,COL.home,'🏠'],['battery',k.grid_batt||0,COL.batt,'🔋']]);
 }
 async function loadHistory(){
-  try{const r=await fetch('history.json?range='+_range,{cache:'no-store'});drawTrends(await r.json());}
+  try{const r=await fetch('history.json?'+_qs(),{cache:'no-store'});drawTrends(await r.json());}
   catch(e){}
 }
 function profileChart(svgId,lines){
@@ -1376,7 +1383,7 @@ function renderStats(d){
   profileChart('chart-prof-home', [{data:p.home, color:COL.home, w:1.6,op:.45,dash:true,name:'typical'},{data:ty.profile_home, color:COL.home, w:2.4,name:'today'}]);
 }
 async function loadStats(){
-  try{const r=await fetch('stats.json?range='+_range,{cache:'no-store'});renderStats(await r.json());}catch(e){}
+  try{const r=await fetch('stats.json?'+_qs(),{cache:'no-store'});renderStats(await r.json());}catch(e){}
 }
 function money(v){if(v==null)return'—';return (v<0?'-$':'$')+Math.abs(v).toFixed(2);}
 function barChart(svgId,times,vals){
@@ -1400,7 +1407,7 @@ function barChart(svgId,times,vals){
   wireChart(svg,{times,series:[{data:vals,color:cssVar('--acc'),name:'net'}],x0,x1,tmin,tmax,y0,y1,hour:false,unit:'$'});
 }
 function renderPricing(d){
-  const t=d.today||{};
+  const t=d.totals||{};
   if(d.plan)$('price_plan').textContent=d.plan;
   $('pr_cost').textContent=money(t.cost);
   $('pr_credit').textContent=money(t.credit);
@@ -1412,7 +1419,7 @@ function renderPricing(d){
   $('price_note').innerHTML='Over this range you paid <b>'+money(tt.cost)+'</b> for grid imports and earned <b>'+money(tt.credit)+'</b> in export credit → net <b>'+money(tt.net)+'</b>; your solar + battery saved you <b>'+money(tt.savings)+'</b> vs buying it all from the grid. Rates are editable PG&E EV2-A defaults ('+(d.export_mode==='nem2'?'exports credited at the TOU rate — NEM 2':'flat export rate — NEM 3')+').';
 }
 async function loadPricing(){
-  try{const r=await fetch('pricing.json?range='+_range,{cache:'no-store'});renderPricing(await r.json());}catch(e){}
+  try{const r=await fetch('pricing.json?'+_qs(),{cache:'no-store'});renderPricing(await r.json());}catch(e){}
 }
 
 async function savePwd(){
@@ -1632,16 +1639,41 @@ function tick(){
     $('age').textContent='updated '+s+'s ago';}
 }
 async function load(){try{const r=await fetch('data.json',{cache:'no-store'});render(await r.json());}catch(e){}}
-document.querySelectorAll('#ranges .rbtn').forEach(b=>b.onclick=()=>{
-  _range=+b.dataset.r;
-  document.querySelectorAll('#ranges .rbtn').forEach(x=>x.classList.toggle('active',x===b));
+function applyWindow(){
+  _win=computeWindow();
+  $('winLabel').textContent=_win.label;
+  const nx=$('navNext'); nx.disabled=(_offset<=0); nx.style.opacity=_offset<=0?0.35:1;
   loadHistory(); loadStats(); loadPricing();
+}
+document.querySelectorAll('#grans .tbtn').forEach(b=>b.onclick=()=>{
+  _gran=b.dataset.g; _offset=0;
+  document.querySelectorAll('#grans .tbtn').forEach(x=>x.classList.toggle('active',x===b));
+  applyWindow();
 });
+$('navPrev').onclick=()=>{ _offset++; applyWindow(); };
+$('navNext').onclick=()=>{ if(_offset>0){ _offset--; applyWindow(); } };
 let _v0='flow';try{_v0=localStorage.getItem('pwview')||'flow';}catch(e){}
 setView(_v0);
 load();setInterval(load,3000);setInterval(tick,1000);
 </script>
 </body></html>"""
+
+
+def _win(q):
+    """Parse ?start=&end= (unix seconds); default to the last 24h, clamped to retention."""
+    now = int(time.time())
+    try:
+        end = int(q.get("end", [now])[0])
+    except Exception:
+        end = now
+    try:
+        start = int(q.get("start", [end - 86400])[0])
+    except Exception:
+        start = end - 86400
+    start = max(start, now - HISTORY_DAYS * 86400 - 172800)
+    if end <= start:
+        end = start + 3600
+    return start, end
 
 
 class H(BaseHTTPRequestHandler):
@@ -1711,12 +1743,8 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path.startswith("/history.json"):
-            q = parse_qs(urlparse(self.path).query)
-            try:
-                range_s = max(300, min(int(q.get("range", ["86400"])[0]), HISTORY_DAYS * 86400))
-            except Exception:
-                range_s = 86400
-            body = json.dumps(history(range_s)).encode()
+            start, end = _win(parse_qs(urlparse(self.path).query))
+            body = json.dumps(history(start, end)).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
@@ -1724,12 +1752,8 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path.startswith("/stats.json"):
-            q = parse_qs(urlparse(self.path).query)
-            try:
-                range_s = max(300, min(int(q.get("range", ["604800"])[0]), HISTORY_DAYS * 86400))
-            except Exception:
-                range_s = 604800
-            body = json.dumps(stats(range_s)).encode()
+            start, end = _win(parse_qs(urlparse(self.path).query))
+            body = json.dumps(stats(start, end)).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
@@ -1737,12 +1761,8 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path.startswith("/pricing.json"):
-            q = parse_qs(urlparse(self.path).query)
-            try:
-                range_s = max(300, min(int(q.get("range", ["604800"])[0]), HISTORY_DAYS * 86400))
-            except Exception:
-                range_s = 604800
-            body = json.dumps(pricing(range_s)).encode()
+            start, end = _win(parse_qs(urlparse(self.path).query))
+            body = json.dumps(pricing(start, end)).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
